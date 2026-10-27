@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.sample
+.git
+.gitea
+**/__pycache__
+**/*.pyc
+.ruff_cache
+.pytest_cache
+*.swp
+data/
+tests/
+tools/
+docs/

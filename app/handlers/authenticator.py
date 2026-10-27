@@ -1,53 +1,65 @@
-import asyncio
+import hmac
 import logging
-import os
+
 from aiosmtpd.smtp import AuthResult, LoginPassword
-from aiosmtpd.handlers import Message
 
 from event_bus import event_bus_instance
+from handlers.access import LoginLockout
+from logfmt import kv, peer_ip, session_fields
 
-class Authenticator():       
+log = logging.getLogger("relay")
+
+
+class Authenticator:
     """
-    A simple authenticator that checks for a hardcoded username and password.
-    In a real application, this would interact with a database, LDAP, etc.
+    Checks the SMTP login against SMTP_AUTH_USER / SMTP_AUTH_PASS.
+
+    aiosmtpd calls this for AUTH PLAIN and AUTH LOGIN. Plaintext logins are allowed
+    (older scanners cannot do STARTTLS) but logged as warnings with the device IP.
     """
+
+    def __init__(self, username: str, password: str, lockout: LoginLockout | None = None):
+        self._username = username.encode("utf-8")
+        self._password = password.encode("utf-8")
+        self.lockout = lockout or LoginLockout()
+
     def __call__(self, server, session, envelope, mechanism, auth_data):
-        """
-        This method is called by aiosmtpd when an AUTH command is received.
+        ip = peer_ip(session)
+        fields = session_fields(session)
+        fields["mech"] = mechanism
 
-        Args:
-            server: The SMTP server instance.
-            session: The SMTP session object.
-            envelope: The SMTP envelope object (contains email transaction details).
-            mechanism: The authentication mechanism (e.g., 'PLAIN', 'LOGIN').
-            auth_data: An object containing authentication data. For 'PLAIN' and 'LOGIN',
-                       this will be an instance of aiosmtpd.smtp.LoginPassword.
+        if not isinstance(auth_data, LoginPassword):
+            log.warning(kv("auth failed", **fields, reason="unsupported-mechanism"))
+            return AuthResult(success=False, handled=False, message="504 5.5.4 Unrecognized authentication type")
 
-        Returns:
-            AuthResult: An AuthResult object indicating success or failure.
-        """
-        logging.debug(f"Authentication attempt: Mechanism={mechanism}")
+        fields["user"] = auth_data.login.decode("utf-8", "replace")
+        if self.lockout.is_locked(ip):
+            log.warning(kv("auth locked", **fields))
+            return AuthResult(
+                success=False, handled=False, message="454 4.7.0 Too many failed logins, try again later"
+            )
 
-        event_bus_instance.publishSync('before_auth', auth_data)
+        try:
+            event_bus_instance.publishSync("before_auth", auth_data)
+        except Exception:
+            log.exception(kv("auth error", **fields, reason="before_auth-middleware"))
+            return AuthResult(success=False, handled=False, message="454 4.7.0 Temporary authentication failure")
 
-        smtp_user = os.environ.get("SMTP_AUTH_USER", "")
-        smtp_pass = os.environ.get("SMTP_AUTH_PASS", "")
+        # Compare both parts, always, in constant time.
+        user_ok = hmac.compare_digest(auth_data.login, self._username)
+        pass_ok = hmac.compare_digest(auth_data.password, self._password)
+        if not (user_ok and pass_ok):
+            fails = self.lockout.record_failure(ip)
+            log.warning(kv("auth failed", **fields, fails=fails))
+            return AuthResult(success=False, handled=False, message="535 5.7.8 Authentication credentials invalid")
 
-        if isinstance(auth_data, LoginPassword):
-            username = auth_data.login.decode('utf-8')
-            password = auth_data.password.decode('utf-8')
-
-            logging.debug(f"Attempting to authenticate user: {username}")
-
-            # Hardcoded credentials for demonstration
-            if username == smtp_user and password == smtp_pass:
-                logging.info(f"Authentication successful for user: {username}")
-                event_bus_instance.publishSync('after_auth', auth_data)
-                
-                return AuthResult(success=True)
-            else:
-                logging.warning(f"Authentication failed for user: {username}")
-                return AuthResult(success=False, handled=False, message="535 Invalid credentials")
+        self.lockout.record_success(ip)
+        if fields["tls"] == "no":
+            log.warning(kv("auth ok", **fields, note="plaintext-login-enable-STARTTLS-on-this-device"))
         else:
-            logging.error(f"Unsupported auth_data type for mechanism {mechanism}: {type(auth_data)}")
-            return AuthResult(success=False, handled=False, message="504 Authentication mechanism not supported")
+            log.info(kv("auth ok", **fields))
+        try:
+            event_bus_instance.publishSync("after_auth", auth_data)
+        except Exception:
+            log.exception(kv("auth error", **fields, reason="after_auth-middleware"))
+        return AuthResult(success=True, auth_data=auth_data)

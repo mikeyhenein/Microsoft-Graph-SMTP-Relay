@@ -1,0 +1,27 @@
+---
+
+services:
+  smtp-relay:
+    build: .
+    container_name: microsoft-graph-smtp-relay
+    restart: unless-stopped
+    # Secrets and settings live in .env (not committed); copy .env.sample to start.
+    env_file: .env
+    ports:
+      # host:container. Devices that expect port 25 or 587: use "25:2525" or "587:2525".
+      - "2525:2525"
+      # Dashboard (only listens when DASHBOARD_USER and DASHBOARD_PASS are set)
+      - "8025:8080"
+    volumes:
+      # TLS certificate, retry queue and optional log file
+      - relay-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  relay-data:

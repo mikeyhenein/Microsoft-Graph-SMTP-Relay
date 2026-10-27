@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Auto detect text files; keep LF in the working tree (the code runs in Linux containers)
+* text=auto eol=lf
+*.pdf binary
+*.jpg binary

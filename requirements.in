@@ -1,0 +1,7 @@
+# Runtime dependencies. Lock with:
+#   uv pip compile requirements.in --generate-hashes --python-version 3.14 -o requirements.txt
+aiosmtpd
+aiohttp
+cryptography
+msal
+python-dotenv
