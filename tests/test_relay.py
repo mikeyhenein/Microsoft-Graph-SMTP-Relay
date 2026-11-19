@@ -1,5 +1,6 @@
 """End to end: a real SMTP server on a random port, smtplib as the device, a fake Graph."""
 
+import asyncio
 import logging
 import textwrap
 import time
@@ -49,11 +50,15 @@ async def test_wrong_password_then_lockout(relay, caplog):
     # smtplib tries PLAIN, then LOGIN: each bad exchange is two failed attempts.
     assert (await exchange(relay.port, password="wrong")).login[0] == 535
     assert (await exchange(relay.port, password="wrong")).login[0] == 535
-    assert (await exchange(relay.port, password="wrong")).login[0] in (535, 454)  # 5th failure locks
-    locked = await exchange(relay.port)  # right password, but the IP is locked now
+    assert (await exchange(relay.port, password="wrong")).login[0] in (535, 454)  # 5th failure slows it down
+    locked = await exchange(relay.port)  # right password, but within 10 s of the last checked attempt
     assert locked.login[0] == 454
     assert log_lines(caplog, "auth locked")
-    assert "fails=5" in log_lines(caplog, "auth failed")[-1].getMessage()
+    assert any("fails=5" in r.getMessage() for r in log_lines(caplog, "auth failed"))
+    # Red-team finding 5: the right password must not stay shut out with the guesser.
+    relay.authenticator.lockout.slow = 0.2
+    await asyncio.sleep(0.3)
+    assert (await exchange(relay.port)).data[0] == 250
 
 
 async def test_sender_rules(relay, fake_graph, caplog):
@@ -151,6 +156,15 @@ async def test_without_a_queue_outage_answers_451(settings, fake_graph, start_re
     fake_graph.defaults["sendMail"] = 503
     result = await exchange(relay.port)
     assert result.data[0] == 451
+
+
+async def test_full_queue_tells_the_device_to_retry(relay, fake_graph):
+    fake_graph.defaults["sendMail"] = 503
+    relay.queue.max_jobs = 1
+    assert (await exchange(relay.port)).data[1].startswith(b"2.0.0 Queued as ")
+    full = await exchange(relay.port)
+    assert full.data == (451, b"4.3.1 Retry queue is full, try again later")
+    assert len(relay.queue.jobs()) == 1
 
 
 async def test_oversized_message_is_refused_by_size(settings, start_relay, fake_graph):

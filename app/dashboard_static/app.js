@@ -17,11 +17,21 @@ const FIXES = {
     + 'Turn off certificate verification on the device.',
   'tls-handshake-failed': 'Try STARTTLS without certificate verification, or no encryption.',
   'login-failed': 'Correct the username or password on the device (SMTP_AUTH_USER / SMTP_AUTH_PASS).',
-  'locked': 'Correct the SMTP password on the device. It unlocks by itself after 15 minutes.',
+  'locked': 'Correct the SMTP password on the device. Until then the relay checks one login every 10 seconds '
+    + 'from this address.',
   'sender-not-allowed': 'Add the device\'s sender address to SMTP_ALLOWED_SENDERS, or change it on the device.',
   'invalid-sender': 'Set a valid sender address on the device.',
   'from-header-mismatch': 'The email\'s From line differs from the sender the device uses. Make them match.',
-  'microsoft-refused': 'Microsoft 365 refused this mailbox. Check the app\'s Exchange scope (tools/Setup-RelayTenant.ps1).',
+  'sender-header-mismatch': 'The email\'s Sender line differs from the sender the device uses. Remove it or make them match.',
+  'malformed-headers': 'The device sent an email with broken header lines. Update its firmware or software.',
+  'headers-too-large': 'The email\'s header lines are over 64 KB, usually a very long recipient list. Split the mailing.',
+  'too-many-recipients': 'More than 500 recipients in one email. Split the mailing.',
+  'too-many-connections':'This address opened too many connections at once or too fast, so the relay turned some '
+    + 'away. Check the device or app for a retry loop.',
+  'too-much-data-before-login': 'The device sent a lot of data without logging in, so the relay hung up. '
+    + 'Check that it is set to log in (SMTP_AUTH_USER / SMTP_AUTH_PASS).',
+  'too-many-commands': 'The device repeated the same command too often on one connection, so the relay hung up.',
+  'microsoft-refused':'Microsoft 365 refused this mailbox. Check the app\'s Exchange scope (tools/Setup-RelayTenant.ps1).',
 };
 const REFUSALS = {
   'sender-not-allowed': 'sender not allowed',
@@ -29,6 +39,11 @@ const REFUSALS = {
   'from-header-mismatch': 'From line mismatch',
   'unparseable': 'unreadable message',
   'middleware-error': 'middleware error',
+  'sender-header-mismatch': 'Sender line mismatch',
+  'malformed-headers': 'malformed headers',
+  'headers-too-large': 'headers too large',
+  'too-many-recipients': 'too many recipients',
+  'processing-error': 'could not be processed',
 };
 
 const state = { level: 'all', query: '', summary: null, logOpen: false, fromFilled: false };

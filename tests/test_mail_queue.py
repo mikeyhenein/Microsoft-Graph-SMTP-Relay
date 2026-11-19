@@ -1,7 +1,10 @@
 import json
+import os
 import time
 
-from mail_queue import Job, MailQueue
+import pytest
+
+from mail_queue import Job, MailQueue, QueueFull
 from retry import DeliveryError
 
 
@@ -34,6 +37,30 @@ def test_put_writes_message_then_metadata(tmp_path):
     assert queue.read(job) == b"hello"
     assert [j.id for j in queue.jobs()] == [job.id]
     assert not list((tmp_path / "queue").glob("*.tmp"))
+
+
+def test_full_queue_refuses_more(tmp_path):
+    queue = open_queue(tmp_path)
+    queue.max_jobs = 2
+    queue.put(make_job(), b"a")
+    queue.put(make_job(), b"b")
+    with pytest.raises(QueueFull):
+        queue.put(make_job(), b"c")
+    queue.max_jobs, queue.max_bytes = 10, 5
+    with pytest.raises(QueueFull):
+        queue.put(make_job(), b"cdef")
+    assert len(queue.jobs()) == 2
+
+
+def test_failed_messages_are_deleted_after_30_days(tmp_path):
+    clock = Clock(time.time())
+    queue = open_queue(tmp_path, clock)
+    old, recent = queue.failed_dir / "1-old.eml", queue.failed_dir / "2-new.eml"
+    for path in (old, recent):
+        path.write_bytes(b"x")
+    os.utime(old, (clock.now - 31 * 86400, clock.now - 31 * 86400))
+    assert queue.prune_failed() == 1
+    assert not old.exists() and recent.exists()
 
 
 def test_recover_moves_orphans_and_removes_temp_files(tmp_path):

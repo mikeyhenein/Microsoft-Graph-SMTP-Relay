@@ -1,16 +1,16 @@
 """
 What the dashboard shows: recent messages, devices by IP, and the live log.
 
-Fed entirely by the relay's own log lines (a logging handler parses the key=value
-lines), so the dashboard always matches `docker logs`. History is kept in a small
-SQLite file on the data volume so it survives restarts.
+Fed entirely by the relay's own log lines, so the dashboard always matches `docker logs`.
+The fields come from the `kv()` object behind each line, never from re-reading the text,
+so a device name containing quotes or `key=value` text cannot add or change fields.
+History is kept in a small SQLite file on the data volume so it survives restarts.
 """
 
 from __future__ import annotations
 
 import collections
 import logging
-import re
 import sqlite3
 import threading
 import time
@@ -20,15 +20,18 @@ RETENTION_DAYS = 30
 DEVICE_RETENTION_DAYS = 30
 LOG_LINES = 500
 DAY = 86400.0
+# Hard caps on top of the 30 days, so a flood cannot grow the history file without bound.
+MAX_MESSAGE_ROWS = 200_000
+MAX_DEVICE_ROWS = 5_000
+PRUNE_EVERY_WRITES = 10_000
 
 # Rejections decided by the relay's own rules (as opposed to Microsoft 365 refusing).
 RELAY_RULE_REASONS = {"sender-not-allowed", "invalid-sender", "from-header-mismatch", "unparseable",
-                      "invalid-recipient", "middleware-error", "skip_send"}
+                      "invalid-recipient", "middleware-error", "skip_send", "sender-header-mismatch",
+                      "malformed-headers", "headers-too-large", "too-many-recipients", "processing-error"}
 
 RESULT_LABELS = {"sent": "Sent", "queued": "Queued", "rejected": "Rejected", "deferred": "Deferred",
                  "skipped": "Skipped", "failed": "Failed", "cancelled": "Cancelled"}
-
-_FIELD = re.compile(r'(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|\S*)')
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -57,19 +60,10 @@ TLS_LABELS = {
     "handshake-failed": "TLS failed",
 }
 
-
-def parse_kv(text: str) -> tuple[str, dict[str, str | None]]:
-    """'auth ok ip=1.2.3.4 user=relay' -> ('auth ok', {'ip': '1.2.3.4', 'user': 'relay'})."""
-    first = _FIELD.search(text)
-    if first is None:
-        return text.strip(), {}
-    fields: dict[str, str | None] = {}
-    for match in _FIELD.finditer(text):
-        value = match.group(2)
-        if len(value) >= 2 and value[0] == value[-1] == '"':
-            value = value[1:-1].replace('\\"', '"')
-        fields[match.group(1)] = None if value in ("", "-") else value
-    return text[: first.start()].strip(), fields
+DROP_LABELS = {
+    "too-much-data-before-login": "Disconnected: too much data before login",
+    "too-many-commands": "Disconnected: too many commands",
+}
 
 
 def _int(value: str | None) -> int | None:
@@ -117,6 +111,7 @@ class ActivityStore:
             except sqlite3.OperationalError:
                 pass  # already there
         self._last_prune = 0.0
+        self._writes = 0
         self.prune()
 
     def close(self) -> None:
@@ -128,7 +123,16 @@ class ActivityStore:
         with self._lock:
             self._db.execute("DELETE FROM messages WHERE ts < ?", (now - RETENTION_DAYS * DAY,))
             self._db.execute("DELETE FROM devices WHERE last_seen < ?", (now - DEVICE_RETENTION_DAYS * DAY,))
+            self._db.execute(
+                "DELETE FROM messages WHERE id <= (SELECT id FROM messages ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                (MAX_MESSAGE_ROWS,),
+            )
+            self._db.execute(
+                "DELETE FROM devices WHERE ip IN (SELECT ip FROM devices ORDER BY last_seen DESC LIMIT -1 OFFSET ?)",
+                (MAX_DEVICE_ROWS,),
+            )
         self._last_prune = now
+        self._writes = 0
 
     # --- writing (from the log handler) ------------------------------------------------
 
@@ -157,6 +161,13 @@ class ActivityStore:
                 reason = f.get("reason") or "handshake-failed"
                 self._device(ip, ts, name=f.get("name"), hostname=f.get("host"),
                              result=TLS_LABELS.get(reason, "TLS failed"), kind="rejected", reason=f"tls-{reason}")
+            elif event == "connection refused":
+                self._device(ip, ts, result="Turned away: too many connections", kind="rejected",
+                             reason="too-many-connections")
+            elif event == "connection dropped":
+                reason = f.get("reason") or "dropped"
+                self._device(ip, ts, result=DROP_LABELS.get(reason, "Disconnected by the relay"), kind="rejected",
+                             reason=reason)
             elif event == "auth ok":
                 self._device(ip, ts, tls=f.get("tls"), result="Logged in", kind="neutral", reason="")
             elif event == "auth failed":
@@ -164,7 +175,7 @@ class ActivityStore:
                 self._device(ip, ts, result=f"Login failed ({fails})" if fails else "Login failed", kind="rejected",
                              reason="login-failed")
             elif event == "auth locked":
-                self._device(ip, ts, result="Locked out · too many bad logins", kind="rejected", reason="locked")
+                self._device(ip, ts, result="Slowed down · too many bad logins", kind="rejected", reason="locked")
             elif event == "queue sent":
                 self._db.execute(
                     "UPDATE messages SET result='sent', graph=?, attempts=COALESCE(attempts, 0) + ? WHERE queue_id=?",
@@ -176,7 +187,8 @@ class ActivityStore:
             elif event == "queue cancelled":
                 self._db.execute("UPDATE messages SET result='cancelled', reason='cancelled' WHERE queue_id=?",
                                  (f.get("id"),))
-        if ts - self._last_prune > 3600:
+        self._writes += 1
+        if ts - self._last_prune > 3600 or self._writes >= PRUNE_EVERY_WRITES:
             self.prune()
 
     def _insert_message(self, ts, f, result, sender, rcpts, reason) -> None:
@@ -269,8 +281,8 @@ class ActivityLogHandler(logging.Handler):
             if record.exc_info and record.exc_info[0] is not None:
                 text = f"{text} ({record.exc_info[0].__name__}: {record.exc_info[1]})"
             self.lines.append({"ts": record.created, "level": record.levelname, "text": text})
-            if record.name == "relay" and self.store is not None:
-                event, fields = parse_kv(record.getMessage())
-                self.store.record(event, fields, record.created)
+            line = record.msg
+            if record.name == "relay" and self.store is not None and hasattr(line, "fields"):
+                self.store.record(line.event, line.fields, record.created)
         except Exception:
             self.handleError(record)

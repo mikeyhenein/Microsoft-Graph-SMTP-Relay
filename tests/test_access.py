@@ -39,17 +39,46 @@ def test_sender_allowed_exact_and_domain():
     assert not sender_allowed("x@lulu.test.evil.com", patterns)
 
 
-def test_lockout_after_five_failures_then_expires():
+def test_five_failures_slow_an_address_down_without_locking_it_out():
     now = [1000.0]
-    lockout = LoginLockout(max_failures=5, window=900, lockout=900, clock=lambda: now[0])
+    lockout = LoginLockout(max_failures=5, window=900, slow=10, clock=lambda: now[0])
     for expected in range(1, 5):
+        assert lockout.allow("10.0.0.9")
         assert lockout.record_failure("10.0.0.9") == expected
-        assert not lockout.is_locked("10.0.0.9")
+    assert lockout.allow("10.0.0.9")
     lockout.record_failure("10.0.0.9")
-    assert lockout.is_locked("10.0.0.9")
-    assert not lockout.is_locked("10.0.0.10")  # per IP
-    now[0] += 901
-    assert not lockout.is_locked("10.0.0.9")
+    assert lockout.throttled("10.0.0.9") and not lockout.throttled("10.0.0.10")  # per address
+    assert lockout.allow("10.0.0.9")  # one checked attempt...
+    lockout.record_failure("10.0.0.9")
+    assert not lockout.allow("10.0.0.9")  # ...then nothing for 10 seconds
+    now[0] += 10
+    assert lockout.allow("10.0.0.9")  # the right password gets in on this one
+    lockout.record_success("10.0.0.9")
+    assert not lockout.throttled("10.0.0.9") and lockout.allow("10.0.0.9")
+
+
+def test_guessing_held_to_one_try_per_interval():
+    now = [0.0]
+    lockout = LoginLockout(max_failures=5, slow=10, clock=lambda: now[0])
+    checked = 0
+    for _ in range(600):  # one guess every 0.1 s for a minute
+        if lockout.allow("ip"):
+            checked += 1
+            lockout.record_failure("ip")
+        now[0] += 0.1
+    assert checked <= 5 + 6 + 1
+
+
+def test_guesses_spread_over_many_addresses_slow_every_untrusted_address():
+    now = [0.0]
+    lockout = LoginLockout(max_failures=5, storm=30, slow=10, clock=lambda: now[0])
+    lockout.record_success("10.0.0.40")  # the scanner has logged in before
+    for i in range(31):
+        lockout.record_failure(f"10.9.0.{i}")
+    assert lockout.throttled("10.9.9.9")  # a fresh address is slowed during the storm
+    assert not lockout.throttled("10.0.0.40")
+    now[0] += 61
+    assert not lockout.throttled("10.9.9.9")
 
 
 def test_success_clears_failures_and_old_failures_age_out():

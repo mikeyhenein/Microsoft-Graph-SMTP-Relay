@@ -6,6 +6,7 @@ the retry queue and the live log, and send a test message through the relay.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hmac
 import html
 import logging
@@ -21,7 +22,7 @@ from aiohttp import web
 from activity import RETENTION_DAYS, ActivityLogHandler, ActivityStore
 from config import Settings
 from handlers.access import LoginLockout, normalize_mailbox, sender_allowed, valid_recipient
-from logfmt import kv
+from logfmt import MAX_NAME, clean, kv
 from mail_queue import MailQueue
 from version import __version__
 
@@ -31,9 +32,11 @@ STATIC_DIR = Path(__file__).resolve().parent / "dashboard_static"
 STATIC_FILES = {"app.css": "text/css", "app.js": "text/javascript"}
 COOKIE = "relay_session"
 SESSION_IDLE = 8 * 3600
+MAX_SESSIONS = 100
+TEST_SENDS_PER_MINUTE = 5
 LOGIN_ERRORS = {
     "bad": "Wrong username or password.",
-    "locked": "Too many failed sign-ins from this address. Try again in 15 minutes.",
+    "locked": "Too many failed sign-ins from this address. Wait 10 seconds between attempts.",
 }
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -110,8 +113,8 @@ class Dashboard:
         self.lockout = LoginLockout()
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
-        self._login_html = (STATIC_DIR / "login.html").read_text(encoding="utf-8").replace(
-            "<!--version-->", __version__)
+        self._login_html = (STATIC_DIR / "login.html").read_text(encoding="utf-8")  # no version before sign-in
+        self._test_sends: collections.deque[float] = collections.deque()
         self._index_html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
     @property
@@ -153,12 +156,32 @@ class Dashboard:
 
     @web.middleware
     async def _security_headers(self, request: web.Request, handler):
-        response = await handler(request)
+        try:
+            if request.method == "POST" and self._cross_site(request):
+                # A form on another site could otherwise post wrong passwords and slow the admin's sign-in.
+                log.warning(kv("dashboard cross-site-post", ip=request.remote, path=request.path))
+                raise web.HTTPForbidden(text="Cross-site request refused.")
+            response = await handler(request)
+        except web.HTTPException as error:  # 403/404/405 get the same headers as everything else
+            headers = {k: v for k, v in error.headers.items() if k.lower() not in ("content-type", "content-length")}
+            response = web.Response(status=error.status, text=error.text or "", headers=headers)
         for name, value in SECURITY_HEADERS.items():
             response.headers.setdefault(name, value)
+        response.headers["Server"] = "relay"  # not the Python and aiohttp versions
         if self.https:
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
         return response
+
+    @staticmethod
+    def _cross_site(request: web.Request) -> bool:
+        fetch_site = request.headers.get("Sec-Fetch-Site")
+        if fetch_site is not None:  # every current browser sends it
+            return fetch_site not in ("same-origin", "none")
+        origin = request.headers.get("Origin")
+        if not origin or origin == "null":
+            return origin == "null"
+        host = origin.split("://", 1)[-1]
+        return host not in (request.host, request.headers.get("X-Forwarded-Host"))
 
     def _signed_in(self, request: web.Request) -> bool:
         token = request.cookies.get(COOKIE)
@@ -195,7 +218,7 @@ class Dashboard:
 
     async def login(self, request: web.Request) -> web.Response:
         ip = request.remote or "-"
-        if self.lockout.is_locked(ip):
+        if not self.lockout.allow(ip):
             log.warning(kv("dashboard login locked", ip=ip))
             return self._redirect("/login?error=locked")
         form = await request.post()
@@ -205,11 +228,17 @@ class Dashboard:
         pass_ok = hmac.compare_digest(password, self.settings.dashboard_pass.encode("utf-8"))
         if not (user_ok and pass_ok):
             fails = self.lockout.record_failure(ip)
-            log.warning(kv("dashboard login failed", ip=ip, user=username.decode("utf-8", "replace"), fails=fails))
-            return self._redirect("/login?error=locked" if self.lockout.is_locked(ip) else "/login?error=bad")
+            log.warning(kv("dashboard login failed", ip=ip, user=clean(username.decode("utf-8", "replace"), MAX_NAME),
+                           fails=fails))
+            return self._redirect("/login?error=locked" if self.lockout.throttled(ip) else "/login?error=bad")
         self.lockout.record_success(ip)
         token = secrets.token_urlsafe(32)
-        self._sessions[token] = self._clock() + SESSION_IDLE
+        now = self._clock()
+        if len(self._sessions) >= MAX_SESSIONS:
+            self._sessions = {t: e for t, e in self._sessions.items() if e >= now}
+            while len(self._sessions) >= MAX_SESSIONS:
+                del self._sessions[min(self._sessions, key=self._sessions.get)]
+        self._sessions[token] = now + SESSION_IDLE
         log.info(kv("dashboard login ok", ip=ip, user=self.settings.dashboard_user))
         response = self._redirect("/")
         response.set_cookie(COOKIE, token, httponly=True, samesite="Strict", secure=self._secure_cookie(request),
@@ -217,9 +246,10 @@ class Dashboard:
         return response
 
     async def logout(self, request: web.Request) -> web.Response:
-        token = request.cookies.get(COOKIE)
-        if token:
-            self._sessions.pop(token, None)
+        if self._signed_in(request):
+            # One admin login: signing out anywhere signs out everywhere (e.g. a forgotten browser).
+            self._sessions.clear()
+            log.info(kv("dashboard logout", ip=request.remote, note="all-sessions-ended"))
         response = self._redirect("/login")
         response.del_cookie(COOKIE, path="/")
         return response
@@ -280,7 +310,8 @@ class Dashboard:
         user = self.settings.dashboard_user
         cancelled, skipped = [], []
         for job_id in ids:
-            status, job = await asyncio.to_thread(self.queue.cancel, job_id, f"cancelled from the dashboard by {user}")
+            # On the event loop, not a thread: the queue worker cannot pick this job up halfway through.
+            status, job = self.queue.cancel(job_id, f"cancelled from the dashboard by {user}")
             if status == "cancelled":
                 cancelled.append(job_id)
                 log.info(kv("queue cancelled", **job.log_fields(), by=user, dashboard_ip=request.remote))
@@ -315,6 +346,13 @@ class Dashboard:
             return web.json_response({"ok": False, "stage": "input", "reply": "From is not a valid address."})
         if not valid_recipient(to):
             return web.json_response({"ok": False, "stage": "input", "reply": "To is not a valid address."})
+        now = self._clock()
+        while self._test_sends and now - self._test_sends[0] >= 60:
+            self._test_sends.popleft()
+        if len(self._test_sends) >= TEST_SENDS_PER_MINUTE:
+            log.warning(kv("dashboard test-send limited", ip=request.remote))
+            return web.json_response({"ok": False, "stage": "input", "reply": "Too many test messages, wait a minute."})
+        self._test_sends.append(now)
 
         s = self.settings
         result = await asyncio.to_thread(

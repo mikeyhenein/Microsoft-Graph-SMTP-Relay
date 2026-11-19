@@ -54,6 +54,7 @@ $State = [ordered]@{
     AppObjectId = $null   # App registration object ID
     SpObjectId  = $null   # Enterprise application (service principal) object ID
     Mailboxes   = @()
+    Declined    = $false  # an app with this name exists and the admin chose not to use it
 }
 
 # --- Output helpers ------------------------------------------------------------------------
@@ -142,19 +143,39 @@ function Connect-Exchange {
 
 # --- Entra app -------------------------------------------------------------------------------
 
+function Get-AppOwners($App) {
+    $owners = @(Get-MgApplicationOwner -ApplicationId $App.Id -ErrorAction SilentlyContinue | ForEach-Object {
+        $p = $_.AdditionalProperties
+        if ($p.userPrincipalName) { $p.userPrincipalName } elseif ($p.displayName) { $p.displayName } else { $_.Id }
+    })
+    if ($owners) { return $owners -join ', ' }
+    return 'none listed'
+}
+
 function Find-RelayApp {
     Connect-Graph
     if ($State.AppId) { return $true }
     $apps = @(Get-MgApplication -Filter "displayName eq '$(ConvertTo-ODataString $AppName)'")
     if ($apps.Count -eq 0) { return $false }
+    # Anyone in the tenant may be able to register an app with this name. The app chosen here gets
+    # mail permissions, so show who owns it and let the admin decide, defaulting to No.
+    Write-Warn "Found $($apps.Count) existing app(s) named '$AppName'. Check it is yours before the relay uses it:"
+    for ($i = 0; $i -lt $apps.Count; $i++) {
+        Write-Note ("  [{0}] client ID {1}, created {2:yyyy-MM-dd}, owners: {3}" -f ($i + 1), $apps[$i].AppId,
+            $apps[$i].CreatedDateTime, (Get-AppOwners $apps[$i]))
+    }
     $app = $apps[0]
     if ($apps.Count -gt 1) {
-        Write-Warn "Found $($apps.Count) apps named '$AppName':"
-        for ($i = 0; $i -lt $apps.Count; $i++) {
-            Write-Note "  [$($i + 1)] AppId $($apps[$i].AppId), created $($apps[$i].CreatedDateTime)"
+        $pick = 0
+        while ($pick -lt 1 -or $pick -gt $apps.Count) {
+            [void][int]::TryParse((Read-Host "  Which one should the relay use? (1-$($apps.Count))"), [ref]$pick)
         }
-        $pick = [int](Read-Host '  Which one should the relay use? (number)')
         $app = $apps[$pick - 1]
+    }
+    if (-not (Read-YesNo "Use the app with client ID $($app.AppId) for the relay?" $false)) {
+        Write-Warn "Not using it. To create a separate app, run the script again with -AppName 'A different name'."
+        $State.Declined = $true
+        return $false
     }
     $State.AppId = $app.AppId
     $State.AppObjectId = $app.Id
@@ -168,6 +189,8 @@ function Step-CreateApp {
     Connect-Graph
     if (Find-RelayApp) {
         Write-Ok "App '$AppName' already exists (client ID $($State.AppId))."
+    } elseif ($State.Declined) {
+        return
     } else {
         if (-not (Read-YesNo "Create a new single-tenant app named '$AppName'?")) { return }
         $app = New-MgApplication -DisplayName $AppName -SignInAudience 'AzureADMyOrg' `
@@ -331,6 +354,21 @@ function Step-Roles {
     }
     # Exchange shows the service principal's object ID as the assignee.
     $assignees = @($State.SpObjectId, $State.AppId, $AppName)
+    # An assignment of a mail role to this app without the scope lets it send as every mailbox,
+    # whatever the scoped assignment says (the two add together).
+    $unscoped = @(foreach ($role in @('Application Mail.Send', 'Application Mail.ReadWrite')) {
+        Get-ManagementRoleAssignment -Role $role -ErrorAction SilentlyContinue | Where-Object {
+            "$($_.RoleAssigneeName)" -in $assignees -and "$($_.CustomResourceScope)" -ne $ScopeName
+        }
+    })
+    foreach ($assignment in $unscoped) {
+        $scope = if ("$($assignment.CustomResourceScope)") { "scope '$($assignment.CustomResourceScope)'" } else { 'no scope (every mailbox)' }
+        Write-Warn "'$($assignment.Role)' is also assigned to this app with $scope ($($assignment.Name))."
+        if (Read-YesNo "Remove that assignment so only '$ScopeName' applies?" $true) {
+            Remove-ManagementRoleAssignment -Identity $assignment.Identity -Confirm:$false
+            Write-Ok "Removed $($assignment.Name)."
+        }
+    }
     foreach ($role in $roles) {
         $existing = @(Get-ManagementRoleAssignment -Role $role -ErrorAction SilentlyContinue | Where-Object {
             "$($_.RoleAssigneeName)" -in $assignees -and "$($_.CustomResourceScope)" -eq $ScopeName

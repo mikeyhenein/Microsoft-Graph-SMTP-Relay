@@ -21,6 +21,8 @@ LARGE_MESSAGE_DEFAULT = 35 * 1024 * 1024
 LARGE_MESSAGE_CEILING = 150 * 1024 * 1024
 
 MIN_PASSWORD_LENGTH = 16
+# The placeholders in .env.sample start with this; the code is public, so they are known passwords.
+SAMPLE_PASSWORD_PREFIX = "change-me"  # noqa: S105 - a prefix we refuse, not a password we use
 
 _SENDER_PATTERN = re.compile(r"^(\*|[A-Za-z0-9._+'-]+)@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$")
 _TRUE = {"1", "true", "yes", "on"}
@@ -130,6 +132,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
             "SMTP_AUTH_USER and SMTP_AUTH_PASS are required: every device must log in "
             "(running without a login would make this an open relay)"
         )
+    elif auth_pass.startswith(SAMPLE_PASSWORD_PREFIX):
+        problems.append("SMTP_AUTH_PASS is still the example from .env.sample; set your own password")
     elif len(auth_pass) < MIN_PASSWORD_LENGTH:
         warnings.append(
             f"SMTP_AUTH_PASS is shorter than {MIN_PASSWORD_LENGTH} characters; "
@@ -193,7 +197,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     if bool(dashboard_user) != bool(dashboard_pass):
         problems.append("DASHBOARD_USER and DASHBOARD_PASS must be set together (leave both empty to turn it off)")
     elif dashboard_pass:
-        if len(dashboard_pass) < MIN_PASSWORD_LENGTH:
+        if dashboard_pass.startswith(SAMPLE_PASSWORD_PREFIX):
+            problems.append("DASHBOARD_PASS is still the example from .env.sample; set your own password")
+        elif len(dashboard_pass) < MIN_PASSWORD_LENGTH:
             warnings.append(f"DASHBOARD_PASS is shorter than {MIN_PASSWORD_LENGTH} characters")
         if dashboard_pass == auth_pass:
             warnings.append("DASHBOARD_PASS is the same as SMTP_AUTH_PASS; give the dashboard its own password")

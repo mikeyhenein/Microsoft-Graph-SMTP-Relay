@@ -55,6 +55,23 @@ def header_addresses(msg: EmailMessage, header: str) -> list[tuple[str, str]]:
     return [(name, addr) for name, addr in getaddresses(values) if addr]
 
 
+def build_draft(mime: bytes) -> tuple[dict, list]:
+    """The Graph draft message and the attachments for the large-message path. Blocking."""
+    msg = BytesParser(policy=policy.default).parsebytes(mime)
+    body, content_type, attachments = extract_body_and_attachments(msg)
+    draft = {
+        "subject": str(msg.get("Subject", "")),
+        "body": {"contentType": content_type, "content": body},
+        "toRecipients": graph_recipients(header_addresses(msg, "To")),
+        "ccRecipients": graph_recipients(header_addresses(msg, "Cc")),
+        "bccRecipients": graph_recipients(header_addresses(msg, "Bcc")),
+    }
+    reply_to = graph_recipients(header_addresses(msg, "Reply-To"))
+    if reply_to:
+        draft["replyTo"] = reply_to
+    return draft, attachments
+
+
 def graph_recipients(pairs: list[tuple[str, str]]) -> list[dict]:
     recipients = []
     for name, addr in pairs:
@@ -192,18 +209,7 @@ class GraphClient:
 
     async def send_large(self, mailbox: str, mime: bytes) -> int:
         """Draft, attachments (posted or uploaded in chunks), then send. Needs Mail.ReadWrite."""
-        msg = BytesParser(policy=policy.default).parsebytes(mime)
-        body, content_type, attachments = extract_body_and_attachments(msg)
-        draft = {
-            "subject": str(msg.get("Subject", "")),
-            "body": {"contentType": content_type, "content": body},
-            "toRecipients": graph_recipients(header_addresses(msg, "To")),
-            "ccRecipients": graph_recipients(header_addresses(msg, "Cc")),
-            "bccRecipients": graph_recipients(header_addresses(msg, "Bcc")),
-        }
-        reply_to = graph_recipients(header_addresses(msg, "Reply-To"))
-        if reply_to:
-            draft["replyTo"] = reply_to
+        draft, attachments = await asyncio.to_thread(build_draft, mime)  # parsing a big message is slow
 
         headers = await self._auth_headers()
         headers["Prefer"] = IMMUTABLE_ID

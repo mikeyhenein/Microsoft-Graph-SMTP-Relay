@@ -15,13 +15,28 @@ from config import Settings
 from event_bus import event_bus_instance
 from handlers.access import normalize_mailbox, sender_allowed, valid_recipient
 from handlers.graph_client import GraphClient, graph_recipients, header_addresses
+from handlers.headers import HeaderProblem, check_headers
 from logfmt import kv, session_fields
-from mail_queue import Job, MailQueue
+from mail_queue import Job, MailQueue, QueueFull
 from retry import DeliveryError, deliver_now, queue_delay
 
 log = logging.getLogger("relay")
 
 MIDDLEWARE_EVENTS = ("before_send", "sender", "recipients")
+# Exchange Online's default recipient limit per message.
+MAX_RECIPIENTS = 500
+PARSE_THREADS = 2
+ADDRESS_HEADERS = ("From", "Sender", "To", "Cc", "Bcc", "Reply-To")
+
+
+def _header_addresses(msg: EmailMessage) -> dict[str, list[tuple[str, str]]]:
+    return {header: header_addresses(msg, header) for header in ADDRESS_HEADERS}
+
+
+def _parse_message(raw: bytes, full: bool) -> tuple[EmailMessage, dict[str, list[tuple[str, str]]]]:
+    """Runs in a worker thread. Without middleware only the headers are needed."""
+    msg = BytesParser(policy=policy.default).parsebytes(raw, headersonly=not full)
+    return msg, _header_addresses(msg)
 
 
 def _set_address_header(msg: EmailMessage, header: str, recipients: list[dict]) -> None:
@@ -56,6 +71,7 @@ class MicrosoftGraphHandler:
         self._in_flight = 0
         self._idle = asyncio.Event()
         self._idle.set()
+        self._parse_slots = asyncio.Semaphore(PARSE_THREADS)
 
     @property
     def app(self):
@@ -86,6 +102,8 @@ class MicrosoftGraphHandler:
         return "250 OK"
 
     async def handle_RCPT(self, server: SMTP, session: Session, envelope: Envelope, address: str, rcpt_options):
+        if len(envelope.rcpt_tos) >= MAX_RECIPIENTS:
+            return self._reject(session, "RCPT", "452 4.5.3 Too many recipients", "too-many-recipients", address)
         if not valid_recipient(address):
             return self._reject(session, "RCPT", "553 5.1.3 Invalid recipient address", "invalid-recipient",
                                 address)
@@ -109,18 +127,43 @@ class MicrosoftGraphHandler:
             return reply
 
         try:
-            msg = BytesParser(policy=policy.default).parsebytes(raw)
+            return await self._handle_data(raw, envelope, summary, finish)
         except Exception:
+            # Never echo internals to the device, and answer permanently so it does not retry for ever.
+            log.exception(kv("message error", sid=summary["sid"], ip=summary["ip"]))
+            return finish("rejected", "554 5.6.0 Message could not be processed", logging.WARNING,
+                          reason="processing-error")
+
+    async def _handle_data(self, raw: bytes, envelope: Envelope, summary: dict, finish) -> str:
+        try:
+            counts = check_headers(raw)
+        except HeaderProblem as problem:
+            return finish("rejected", problem.reply, logging.WARNING, reason=problem.reason)
+
+        hooks = self.bus.has_subscribers(*MIDDLEWARE_EVENTS)
+        try:
+            msg, addresses = await self._in_thread(_parse_message, raw, hooks)
+        except Exception:
+            log.warning(kv("message unparseable", sid=summary["sid"], ip=summary["ip"]), exc_info=True)
             return finish("rejected", "554 5.6.0 Message could not be parsed", logging.WARNING,
                           reason="unparseable")
 
-        from_header = header_addresses(msg, "From")
-        if len(from_header) > 1 or (from_header and from_header[0][1].lower() != envelope.mail_from.lower()):
-            return finish("rejected", "550 5.7.1 From header must match the sender address", logging.WARNING,
-                          reason="from-header-mismatch", header_from=",".join(a for _, a in from_header))
+        # A From or Sender line, if present, must be exactly one address: the sender the device logged in with.
+        sender = envelope.mail_from.lower()
+        for header, reason in (("From", "from-header-mismatch"), ("Sender", "sender-header-mismatch")):
+            count, found = counts.get(header.lower(), 0), addresses[header]
+            if count and (count > 1 or len(found) != 1 or found[0][1].lower() != sender):
+                return finish("rejected", f"550 5.7.1 {header} header must match the sender address",
+                              logging.WARNING, reason=reason,
+                              **{f"header_{header.lower()}": ",".join(a for _, a in found) or "(none)"})
+
+        header_rcpts = {a.lower() for h in ("To", "Cc", "Bcc") for _, a in addresses[h]}
+        if len(header_rcpts) > MAX_RECIPIENTS:
+            return finish("rejected", "550 5.5.3 Too many recipients", logging.WARNING,
+                          reason="too-many-recipients", header_recipients=len(header_rcpts))
 
         try:
-            mime = await self._prepare(msg, raw, envelope, summary)
+            mime = await self._prepare(msg, raw, envelope, summary, addresses)
         except Exception:
             log.exception(kv("middleware error", sid=summary["sid"], ip=summary["ip"]))
             return finish("deferred", "451 4.3.0 Message processing failed, try again later", logging.WARNING,
@@ -143,7 +186,13 @@ class MicrosoftGraphHandler:
 
     # --- helpers ----------------------------------------------------------------
 
-    async def _prepare(self, msg: EmailMessage, raw: bytes, envelope: Envelope, summary: dict) -> bytes | None:
+    async def _in_thread(self, fn, *args):
+        """Run CPU-heavy parsing off the event loop, a couple at a time, so one message cannot stall the rest."""
+        async with self._parse_slots:
+            return await asyncio.to_thread(fn, *args)
+
+    async def _prepare(self, msg: EmailMessage, raw: bytes, envelope: Envelope, summary: dict,
+                       addresses: dict[str, list[tuple[str, str]]]) -> bytes | None:
         """
         The bytes to hand to Graph, or None when middleware asked to skip the send.
 
@@ -154,17 +203,20 @@ class MicrosoftGraphHandler:
         hooks = self.bus.has_subscribers(*MIDDLEWARE_EVENTS)
         if hooks:
             await self.bus.publish("before_send", msg)
+            addresses = await self._in_thread(_header_addresses, msg)  # middleware may have changed them
 
-        to = graph_recipients(header_addresses(msg, "To"))
-        cc = graph_recipients(header_addresses(msg, "Cc"))
-        reply_to = graph_recipients(header_addresses(msg, "Reply-To"))
-        existing_bcc = header_addresses(msg, "Bcc")
+        to = graph_recipients(addresses["To"])
+        cc = graph_recipients(addresses["Cc"])
+        reply_to = graph_recipients(addresses["Reply-To"])
+        existing_bcc = addresses["Bcc"]
         in_headers = {r["emailAddress"]["address"].lower() for r in to + cc}
         in_headers.update(a.lower() for _, a in existing_bcc)
 
         envelope_set = {r.lower() for r in envelope.rcpt_tos}
         header_only = sorted(a for a in in_headers if a not in envelope_set)
         if header_only:
+            # Microsoft delivers to these too, so they belong in the message's line on the dashboard.
+            summary["to"] = ",".join([*envelope.rcpt_tos, *header_only])
             log.warning(kv("header-recipients-not-in-envelope", sid=summary["sid"], ip=summary["ip"],
                            addresses=",".join(header_only)))
 
@@ -212,6 +264,10 @@ class MicrosoftGraphHandler:
         )
         try:
             await asyncio.to_thread(self.queue.put, job, mime)
+        except QueueFull as full:
+            log.warning(kv("queue full", id=job.id, ip=summary["ip"], detail=full))
+            return finish("deferred", "451 4.3.1 Retry queue is full, try again later", logging.WARNING,
+                          graph=error.status, attempts=error.attempts, reason="queue-full")
         except OSError as write_error:
             log.error(kv("queue write-failed", id=job.id, error=write_error))
             return finish("deferred", "451 4.3.0 Temporary failure, try again later", logging.WARNING,

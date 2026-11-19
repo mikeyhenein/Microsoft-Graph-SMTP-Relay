@@ -9,7 +9,8 @@ import ssl
 import pytest
 
 import hostnames
-from activity import ActivityStore, parse_kv
+from activity import ActivityStore
+from logfmt import kv
 from smtp_server import classify_tls_failure
 
 
@@ -46,7 +47,7 @@ async def test_untrusted_certificate_is_one_clear_warning(relay, caplog):
     assert await asyncio.to_thread(verifying_client, relay.port) == "self-signed certificate"
     await asyncio.sleep(0.1)
     [line] = relay_lines(caplog, "tls failed")
-    event, fields = parse_kv(line.getMessage())
+    fields = line.msg.fields
     assert line.levelno == logging.WARNING
     assert fields["reason"] == "untrusted-certificate" and fields["name"] == "invoiceninja"
     assert fields["ip"] == "127.0.0.1" and fields["detail"] == "TLSV1_ALERT_UNKNOWN_CA"
@@ -59,7 +60,7 @@ async def test_implicit_tls_is_recognised(relay, caplog):
     await asyncio.to_thread(implicit_tls_client, relay.port)
     await asyncio.sleep(0.1)
     [line] = relay_lines(caplog, "tls failed")
-    assert parse_kv(line.getMessage())[1]["reason"] == "implicit-tls"
+    assert line.msg.fields["reason"] == "implicit-tls"
 
 
 @pytest.mark.parametrize("error, reason", [
@@ -76,15 +77,17 @@ def test_classifier_fallbacks(error, reason):
 def test_device_shows_the_tls_problem_until_it_works_again(tmp_path):
     clock = [1_800_000_000.0]
     store = ActivityStore(tmp_path / "a.db", clock=lambda: clock[0])
-    store.record(*parse_kv("helo sid=a ip=172.18.0.1 user=- tls=no name=invoiceninja host=ninja.lan"), clock[0])
-    store.record(*parse_kv("tls failed sid=a ip=172.18.0.1 name=invoiceninja reason=untrusted-certificate detail=X"),
+    store.record("helo", kv("helo", sid="a", ip="172.18.0.1", tls="no", name="invoiceninja", host="ninja.lan").fields,
                  clock[0])
+    store.record("tls failed", kv("tls failed", sid="a", ip="172.18.0.1", name="invoiceninja",
+                                  reason="untrusted-certificate", detail="X").fields, clock[0])
     [device] = store.summary()["devices"]
     assert device["name"] == "invoiceninja" and device["hostname"] == "ninja.lan"
     assert device["last_reason"] == "tls-untrusted-certificate"
     assert device["last_result"] == "TLS failed: certificate not trusted" and device["last_kind"] == "rejected"
 
-    store.record(*parse_kv("auth ok sid=b ip=172.18.0.1 user=relay tls=yes mech=PLAIN"), clock[0] + 5)
+    store.record("auth ok", kv("auth ok", sid="b", ip="172.18.0.1", user="relay", tls="yes", mech="PLAIN").fields,
+                 clock[0] + 5)
     [device] = store.summary()["devices"]
     assert device["last_reason"] is None and device["last_result"] == "Logged in"
 

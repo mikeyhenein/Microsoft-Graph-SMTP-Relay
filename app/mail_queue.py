@@ -9,6 +9,7 @@ job only exists once its message is safely on disk. Failed jobs move to `failed/
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -25,6 +26,16 @@ from retry import DeliveryError, queue_delay
 log = logging.getLogger("relay")
 
 JOB_ID = re.compile(r"^\d+-[0-9a-f]{8}$")  # Job.new_id(); anything else never touches the filesystem
+
+# Beyond these the relay answers "try again later" instead of queueing, so an outage plus a
+# chatty device cannot fill the data volume. failed/ is emptied after the dashboard's retention.
+MAX_JOBS = 2000
+MAX_BYTES = 1024 * 1024 * 1024
+FAILED_RETENTION_DAYS = 30
+
+
+class QueueFull(OSError):
+    """The queue is at MAX_JOBS or MAX_BYTES."""
 
 
 @dataclass
@@ -68,6 +79,9 @@ class MailQueue:
         self._clock = clock
         self.wake = asyncio.Event()
         self.delivering: str | None = None  # the job being sent right now, which cannot be cancelled
+        self.max_jobs = MAX_JOBS
+        self.max_bytes = MAX_BYTES
+        self._last_failed_prune = 0.0
 
     @classmethod
     def open(cls, directory: Path, max_age_hours: float) -> MailQueue | None:
@@ -90,6 +104,16 @@ class MailQueue:
         return base / f"{job_id}.eml", base / f"{job_id}.json"
 
     def put(self, job: Job, mime: bytes) -> None:
+        """Write a job to disk. Blocking; raises QueueFull when the queue is at its limits."""
+        messages = list(self.dir.glob("*.eml"))
+        if len(messages) >= self.max_jobs:
+            raise QueueFull(f"{len(messages)} messages queued (limit {self.max_jobs})")
+        size = 0
+        for path in messages:
+            with contextlib.suppress(OSError):
+                size += path.stat().st_size
+        if size + len(mime) > self.max_bytes:
+            raise QueueFull(f"{size // 1_000_000} MB queued (limit {self.max_bytes // 1_000_000} MB)")
         eml, meta = self._paths(job.id)
         _write_atomic(eml, mime)
         _write_atomic(meta, json.dumps(asdict(job)).encode())
@@ -143,6 +167,20 @@ class MailQueue:
         self.fail(job, reason)
         return "cancelled", job
 
+    def prune_failed(self) -> int:
+        """Delete failed and cancelled messages older than FAILED_RETENTION_DAYS. Blocking."""
+        now = self._clock()
+        self._last_failed_prune = now
+        removed = 0
+        for path in self.failed_dir.iterdir():
+            with contextlib.suppress(OSError):
+                if now - path.stat().st_mtime > FAILED_RETENTION_DAYS * 86400:
+                    path.unlink()
+                    removed += 1
+        if removed:
+            log.info(kv("queue pruned", dir=self.failed_dir, removed=removed, older_than_days=FAILED_RETENTION_DAYS))
+        return removed
+
     def recover(self) -> None:
         """Startup tidy-up: leftover temp files, and messages whose .json never got written."""
         for tmp in self.dir.glob("*.tmp"):
@@ -167,15 +205,17 @@ class MailQueue:
                 log.error(kv("queue failed", **job.log_fields(), attempts=job.attempts,
                              reason="expired", last_error=job.last_error))
                 continue
+            # Mark it as sending before anything else, so a cancel from the dashboard sees it.
+            self.delivering = job.id
             try:
                 mime = self.read(job)
             except OSError as error:
+                self.delivering = None
                 self.fail(job, f"message file unreadable: {error}")
                 log.error(kv("queue failed", **job.log_fields(), reason="unreadable"))
                 continue
 
             started = time.monotonic()
-            self.delivering = job.id
             try:
                 status = await deliver(job, mime)
             except DeliveryError as error:
@@ -206,6 +246,8 @@ class MailQueue:
             self.wake.clear()
             try:
                 await self.process_due(deliver)
+                if self._clock() - self._last_failed_prune >= 3600:
+                    await asyncio.to_thread(self.prune_failed)
             except Exception:
                 log.exception("queue worker error")
             try:

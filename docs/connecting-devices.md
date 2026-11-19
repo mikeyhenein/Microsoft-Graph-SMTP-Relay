@@ -79,6 +79,22 @@ Open the dashboard. Problems show under **Needs attention** with the fix; the co
 |---|---|---|
 | TLS failed: certificate not trusted | The device verifies certificates | Turn off Verify peer, or install a trusted certificate |
 | TLS failed: device expects SSL/TLS on connect | Encryption set to SSL/TLS | Set it to STARTTLS |
-| Login failed / Locked out | Wrong username or password (5 tries lock the IP for 15 minutes) | Fix the login on the device; it unlocks by itself |
+| Login failed / Slowed down | Wrong username or password (after 5 tries the relay checks one login every 10 seconds from that IP) | Fix the login on the device; the right password still gets in |
 | Sender not allowed | From address not in `SMTP_ALLOWED_SENDERS` | Add it to `.env` (then `docker compose up -d`), or change the device's sender |
+| Refused · From line mismatch / Sender line mismatch | The email's From (or Sender) line names a different address from the sender the device uses | Make them the same on the device |
+| Refused · malformed headers | The email has broken header lines (for example a space before the colon in `From :`) | Update the device's firmware or software |
+| Refused · too many recipients / headers too large | Over 500 recipients, or over 64 KB of header lines | Split the mailing |
+| Turned away: too many connections | Over 50 open connections, or over 600 new ones a minute, from one IP | Look for a retry loop on that device or app |
+| Disconnected: too much data before login | The device sent over 4 KB without logging in | Set it to log in with `SMTP_AUTH_USER` / `SMTP_AUTH_PASS` |
 | Nothing appears at all | The device never reached the relay | Check host/IP and port; on OMV check `postconf relayhost` |
+
+What the relay answers, for reading a device's own error log:
+
+| Reply | Meaning |
+|---|---|
+| `421 4.7.0 Too many connections, try again later` | Per-IP connection limit; the device retries |
+| `421 4.7.0 Too much data before login` / `... sent too many times` | The relay hung up on a misbehaving client |
+| `451 4.3.1 Retry queue is full, try again later` | Microsoft 365 is unreachable and 2,000 messages (or 1 GB) are already waiting |
+| `454 4.7.0 Too many failed logins, try again later` | Within 10 seconds of a checked login from an IP that has failed 5 times |
+| `550 5.7.1 From header must match the sender address` | See "From line mismatch" above |
+| `554 5.6.0 Malformed message headers` / `Message could not be processed` | The message itself is broken; retrying will not help |

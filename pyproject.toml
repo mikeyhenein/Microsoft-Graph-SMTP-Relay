@@ -1,6 +1,6 @@
 [project]
 name = "smtp-graph-relay"
-version = "2.2.2"
+version = "2.3.0"
 description = "SMTP relay that sends mail through the Microsoft Graph API"
 requires-python = ">=3.14"
 license = "MIT"

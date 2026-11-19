@@ -1,20 +1,73 @@
 import logging
 
-from activity import ActivityLogHandler, ActivityStore, parse_kv
+import activity
+from activity import ActivityLogHandler, ActivityStore
 from logfmt import kv
 
 
-def test_parse_kv_round_trips_the_relay_log_format():
+def test_kv_line_carries_its_fields():
     line = kv("auth ok", sid="ab12", ip="192.168.1.40", user="relay", tls="no", note=None,
               reason='POST 503 "busy" now', settings="listen=0.0.0.0:2525 user=relay")
-    event, fields = parse_kv(line)
-    assert event == "auth ok"
-    assert fields == {"sid": "ab12", "ip": "192.168.1.40", "user": "relay", "tls": "no", "note": None,
-                      "reason": 'POST 503 "busy" now', "settings": "listen=0.0.0.0:2525 user=relay"}
+    assert line == ('auth ok sid=ab12 ip=192.168.1.40 user=relay tls=no note=- reason="POST 503 \\"busy\\" now"'
+                    ' settings="listen=0.0.0.0:2525 user=relay"')
+    assert line.event == "auth ok"
+    assert line.fields == {"sid": "ab12", "ip": "192.168.1.40", "user": "relay", "tls": "no", "note": None,
+                           "reason": 'POST 503 "busy" now', "settings": "listen=0.0.0.0:2525 user=relay"}
 
 
-def test_parse_kv_plain_text():
-    assert parse_kv("relay stopped") == ("relay stopped", {})
+def test_kv_escapes_backslashes_and_strips_control_characters():
+    line = kv("helo", ip="10.0.0.1", name='x\\" ip=10.66.66.66 name=CEO-LAPTOP', other="a\x1b[2Jb\x00c\r\nd")
+    assert line == 'helo ip=10.0.0.1 name="x\\\\\\" ip=10.66.66.66 name=CEO-LAPTOP" other="a?[2Jb?c  d"'
+    assert line.fields["ip"] == "10.0.0.1"
+    assert line.fields["name"] == 'x\\" ip=10.66.66.66 name=CEO-LAPTOP'
+    assert "\x1b" not in line and "\x00" not in line
+
+
+def test_forged_fields_in_a_device_name_never_reach_the_dashboard(tmp_path):
+    """Red-team finding 2: a name like `x\\" ip=... ` used to add fields when the log text was re-read."""
+    store = ActivityStore(tmp_path / "a.db")
+    handler = ActivityLogHandler(store)
+    logger = logging.getLogger("relay")
+    logger.addHandler(handler)
+    try:
+        logger.warning(kv("helo", sid="s1", ip="192.168.1.40", name='x\\" ip=10.66.66.66 name=CEO-LAPTOP'))
+        logger.warning(kv("auth failed", sid="s1", ip="192.168.1.40",
+                          user='u\\" ip=192.168.1.50 fails=5', mech="PLAIN", fails=1))
+        logger.warning("relay stopped")  # plain text lines are shown in the live log but never parsed
+    finally:
+        logger.removeHandler(handler)
+    [device] = store.summary()["devices"]
+    assert device["ip"] == "192.168.1.40"
+    assert device["name"] == 'x\\" ip=10.66.66.66 name=CEO-LAPTOP'
+    assert device["last_result"] == "Login failed (1)"
+    assert handler.lines[-1]["text"] == "relay stopped"
+    store.close()
+
+
+def test_turned_away_and_dropped_connections_show_on_the_device(tmp_path):
+    clock = Clock()
+    store = ActivityStore(tmp_path / "a.db", clock=clock)
+    feed(store, clock, kv("connection refused", ip="10.0.0.7", reason="too-many-open-connections", refused=3),
+         kv("connection dropped", sid="s", ip="10.0.0.8", reason="too-much-data-before-login"))
+    devices = {d["ip"]: d for d in store.summary()["devices"]}
+    assert devices["10.0.0.7"]["last_reason"] == "too-many-connections"
+    assert devices["10.0.0.8"]["last_result"] == "Disconnected: too much data before login"
+    store.close()
+
+
+def test_history_is_capped_by_rows_as_well_as_age(tmp_path, monkeypatch):
+    monkeypatch.setattr(activity, "MAX_MESSAGE_ROWS", 5)
+    monkeypatch.setattr(activity, "MAX_DEVICE_ROWS", 3)
+    clock = Clock()
+    store = ActivityStore(tmp_path / "a.db", clock=clock)
+    for i in range(10):
+        clock.now += 1
+        feed(store, clock, kv("message", ip=f"10.0.0.{i}", result="sent", **{"from": "a@b.com"}, to=f"c{i}@d.com"))
+    store.prune()
+    summary = store.summary()
+    assert [m["rcpts"] for m in summary["messages"]] == [f"c{i}@d.com" for i in range(9, 4, -1)]
+    assert [d["ip"] for d in summary["devices"]] == ["10.0.0.9", "10.0.0.8", "10.0.0.7"]
+    store.close()
 
 
 class Clock:
@@ -27,8 +80,7 @@ class Clock:
 
 def feed(store, clock, *lines):
     for line in lines:
-        event, fields = parse_kv(line)
-        store.record(event, fields, clock.now)
+        store.record(line.event, line.fields, clock.now)
 
 
 def test_store_builds_devices_messages_and_stats(tmp_path):
@@ -60,7 +112,7 @@ def test_store_builds_devices_messages_and_stats(tmp_path):
     scanner = devices["192.168.1.40"]
     assert scanner["name"] == "SCANNER-2F" and scanner["tls"] == "no" and scanner["messages_24h"] == 2
     assert scanner["last_result"] == "Sender not allowed" and scanner["last_kind"] == "rejected"
-    assert devices["192.168.1.99"]["last_result"].startswith("Locked out")
+    assert devices["192.168.1.99"]["last_result"].startswith("Slowed down")
 
     queued = next(m for m in summary["messages"] if m["queue_id"] == "q1")
     assert queued["result"] == "sent" and queued["attempts"] == 4

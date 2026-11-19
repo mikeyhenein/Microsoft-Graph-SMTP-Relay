@@ -5,7 +5,7 @@ from aiosmtpd.smtp import AuthResult, LoginPassword
 
 from event_bus import event_bus_instance
 from handlers.access import LoginLockout
-from logfmt import kv, peer_ip, session_fields
+from logfmt import MAX_NAME, clean, kv, peer_ip, session_fields
 
 log = logging.getLogger("relay")
 
@@ -32,9 +32,9 @@ class Authenticator:
             log.warning(kv("auth failed", **fields, reason="unsupported-mechanism"))
             return AuthResult(success=False, handled=False, message="504 5.5.4 Unrecognized authentication type")
 
-        fields["user"] = auth_data.login.decode("utf-8", "replace")
-        if self.lockout.is_locked(ip):
-            log.warning(kv("auth locked", **fields))
+        fields["user"] = clean(auth_data.login.decode("utf-8", "replace"), MAX_NAME)
+        if not self.lockout.allow(ip):
+            log.warning(kv("auth locked", **fields, note="too-many-bad-logins-one-checked-every-10s"))
             return AuthResult(
                 success=False, handled=False, message="454 4.7.0 Too many failed logins, try again later"
             )

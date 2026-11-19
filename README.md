@@ -107,10 +107,12 @@ often taken). It shows:
 
 The dashboard uses the relay's certificate for HTTPS. The default one is self-signed, so the browser warns once.
 Behind a reverse proxy, set `DASHBOARD_HTTPS=false` and let the proxy handle TLS. Sign-ins are rate limited
-(5 failures locks the IP out for 15 minutes) and sessions end after 8 hours idle. History is kept for 30 days in
-`$DATA_DIR/activity.db`. With the dashboard off (no `DASHBOARD_USER`/`DASHBOARD_PASS`), its port is not opened.
+(after 5 failures, one sign-in every 10 seconds from that IP), posts from other sites are refused, test sends are
+limited to 5 a minute, signing out ends every session, and sessions end after 8 hours idle. History is kept for 30
+days (and at most 200,000 messages) in `$DATA_DIR/activity.db`. With the dashboard off (no
+`DASHBOARD_USER`/`DASHBOARD_PASS`), its port is not opened.
 
-The version is shown on the sign-in page, the dashboard footer and the `relay started` log line; see
+The version is shown in the dashboard footer (after sign-in) and the `relay started` log line; see
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Configuration
@@ -159,9 +161,13 @@ disconnect sid=7f3a21 ip=192.168.1.40
   the same problem on the device's row with the fix. `untrusted-certificate` means the device verifies certificates
   and rejects the relay's self-signed one (turn off "verify peer/certificate" on the device, or set `TLS_CERT_FILE`);
   `implicit-tls` means it is set to SSL/TLS instead of STARTTLS; `old-tls-version` means it only speaks TLS 1.0/1.1.
-- `auth failed` / `auth locked`: wrong password; after 5 failures in 15 minutes an IP is locked out for 15 minutes.
+- `auth failed` / `auth locked`: wrong password. After 5 failures in 15 minutes the relay checks one login every
+  10 seconds from that IP and refuses the rest unchecked (`auth locked`); the right password still gets in. When
+  more than 30 wrong passwords a minute arrive from anywhere, IPs that have never logged in are slowed the same way.
+- `connection refused` / `connection dropped`: the limits below turned a client away.
 - `reject ... reason=sender-not-allowed`: the device tried a From address not in `SMTP_ALLOWED_SENDERS`.
-- Queue lines: `queue retry`, `queue sent`, `queue failed` (ERROR: gave up; the message is kept in `queue/failed/`).
+- Queue lines: `queue retry`, `queue sent`, `queue failed` (ERROR: gave up; the message is kept in `queue/failed/`
+  for 30 days).
 
 Find every device that sent mail today:
 
@@ -180,6 +186,26 @@ docker compose logs --since 24h smtp-relay | grep -o 'message sid=[^ ]* ip=[^ ]*
 The queue retries after 1, 5, 15 and 30 minutes, then hourly, until `QUEUE_MAX_AGE_HOURS`. Queued messages are
 stored on the `/data` volume until they are delivered or moved to `queue/failed/`, so treat that volume as
 containing mail. If the queue directory is not writable, temporary failures answer `451` and the device retries.
+The queue holds at most 2,000 messages or 1 GB; beyond that devices get `451 4.3.1` and retry themselves.
+
+## Limits
+
+Built in, no settings. They are per client IP, not a list of who may connect: every IP gets the same allowance.
+
+| Limit | Value | Over it |
+|---|---|---|
+| Open connections per IP / new connections per IP per minute / open in total | 50 / 600 / 1,000 | `421`, before the greeting |
+| Data before login | 4 KB | `421`, connection closed |
+| Same command on one connection | EHLO/HELO 10, AUTH 12, STARTTLS 2, NOOP 200, others 10,000 | `421`, connection closed |
+| Recipients per message (RCPT and headers) | 500, as Exchange Online | `452` / `550` |
+| Header lines per message | 64 KB | `552` |
+
+Messages must also have well-formed header lines (`Name: value`, or continuation lines starting with a space),
+and any From or Sender line must be exactly the sender address. Apps on the Docker host itself arrive from the
+Docker gateway IP, so they share one allowance. Loopback (the healthcheck, the dashboard's test send) is exempt.
+
+The compose file caps the container at 512 MB and 200 processes and rotates its log at 3 x 10 MB. With
+`LARGE_MESSAGES=true`, raise `mem_limit` to 2g.
 
 ## Development
 

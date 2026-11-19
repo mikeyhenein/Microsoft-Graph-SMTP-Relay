@@ -19,10 +19,11 @@ import hostnames
 from activity import ActivityLogHandler, ActivityStore
 from config import Settings
 from dashboard import Dashboard
+from handlers.access import ConnectionGuard
 from handlers.authenticator import Authenticator
 from handlers.graph_client import GraphClient
 from handlers.microsoft_graph import MicrosoftGraphHandler
-from logfmt import kv, peer_ip
+from logfmt import kv, peer_ip, session_fields
 from mail_queue import MailQueue
 from tls import load_tls_context
 from version import __version__
@@ -84,19 +85,34 @@ def _looks_like_tls_hello(data: bytes) -> bool:
     return len(data) >= 2 and data[0] == 0x16 and data[1] == 0x03
 
 
+# How often each command may be used on one connection; over the limit aiosmtpd answers 421 and
+# hangs up. "*" covers MAIL, RCPT, DATA, RSET and the rest, high enough for bulk senders.
+COMMAND_CALL_LIMITS = {"EHLO": 10, "HELO": 10, "STARTTLS": 2, "AUTH": 12, "VRFY": 6, "HELP": 6, "NOOP": 200,
+                       "*": 10_000}
+# Bytes a client may send before it has logged in. A normal EHLO/STARTTLS/AUTH uses well under 1 KB.
+PRE_LOGIN_BYTES = 4096
+
+
 class RelaySMTP(SMTP):
     """
     aiosmtpd's SMTP with a session id, a connect/disconnect line per client, a background
-    reverse-DNS lookup of the client, and one clear log line when TLS setup fails.
+    reverse-DNS lookup of the client, one clear log line when TLS setup fails, and limits
+    on connections and on what a client may send before it logs in.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, guard: ConnectionGuard | None = None, **kwargs):
+        kwargs.setdefault("command_call_limit", COMMAND_CALL_LIMITS)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Requiring AUTH while not requiring TLS")
             super().__init__(*args, **kwargs)
         self.sid = secrets.token_hex(3)
+        self.guard = guard
+        self._admitted_ip: str | None = None
         self._connected = False
         self._saw_data = False
+        self._pre_login_bytes = 0
+        self._dropped = False
+        self._turned_away = False
         self.hostname_task: asyncio.Task | None = None
 
     def _create_session(self):
@@ -113,6 +129,12 @@ class RelaySMTP(SMTP):
             self._connected = True
             peer = transport.get_extra_info("peername")
             ip = peer_ip(self.session)
+            if self.guard is not None and not _is_loopback(ip):
+                refused = self.guard.admit(ip)
+                if refused is not None:
+                    self._refuse(ip, refused)
+                    return
+                self._admitted_ip = ip
             if not _is_loopback(ip):
                 self.hostname_task = self.loop.create_task(hostnames.lookup(ip))
                 self.session.hostname_task = self.hostname_task
@@ -120,7 +142,28 @@ class RelaySMTP(SMTP):
             level = logging.DEBUG if _is_loopback(ip) else logging.INFO
             log.log(level, kv("connect", sid=self.sid, ip=ip, port=peer[1] if isinstance(peer, tuple) else None))
 
+    def _refuse(self, ip: str, reason: str) -> None:
+        """Turn the connection away before the greeting."""
+        self._dropped = self._turned_away = True
+        self._handler_coroutine.cancel()  # never started: no 220 greeting goes out
+        self.transport.write(b"421 4.7.0 Too many connections, try again later\r\n")
+        self.transport.close()
+        refused = self.guard.refused_to_log(ip)
+        if refused is not None:
+            log.warning(kv("connection refused", ip=ip, reason=reason, refused=refused))
+
+    def _drop(self, reason: str, reply: bytes, **extra) -> None:
+        if self._dropped:
+            return
+        self._dropped = True
+        log.warning(kv("connection dropped", **session_fields(self.session), reason=reason, **extra))
+        if self.transport is not None:
+            self.transport.write(reply)
+            self.transport.close()
+
     def data_received(self, data: bytes) -> None:
+        if self._dropped:
+            return
         if not self._saw_data:
             self._saw_data = True
             if _looks_like_tls_hello(data):
@@ -128,14 +171,31 @@ class RelaySMTP(SMTP):
                 self._log_tls_failure("implicit-tls", "TLS ClientHello before any SMTP command")
                 self.transport.close()
                 return
+        if not self.session.authenticated:
+            self._pre_login_bytes += len(data)
+            if self._pre_login_bytes > PRE_LOGIN_BYTES:
+                self._drop("too-much-data-before-login", b"421 4.7.0 Too much data before login\r\n")
+                return
         super().data_received(data)
+
+    async def push(self, status: str | bytes) -> None:
+        # aiosmtpd hangs up with this reply when a command is over COMMAND_CALL_LIMITS.
+        if isinstance(status, str) and status.startswith("421 4.7.0 ") and status.endswith(" sent too many times"):
+            if self._dropped:
+                return  # already hung up; aiosmtpd may still be reading lines that were buffered
+            self._dropped = True
+            log.warning(kv("connection dropped", **session_fields(self.session), reason="too-many-commands",
+                           cmd=status.split()[2]))
+        await super().push(status)
 
     async def handle_exception(self, error: Exception) -> str:
         if isinstance(error, TLSSetupException):
             reason, detail = classify_tls_failure(error.__cause__)
             self._log_tls_failure(reason, detail)
             return "454 4.7.0 TLS not available"  # the connection is closed right after this
-        return await super().handle_exception(error)
+        # aiosmtpd's default would echo the exception text to the device.
+        log.error(kv("smtp error", **session_fields(self.session), error=type(error).__name__), exc_info=error)
+        return "451 4.3.0 Internal error, try again later"
 
     def _log_tls_failure(self, reason: str, detail: str) -> None:
         session = self.session
@@ -145,9 +205,13 @@ class RelaySMTP(SMTP):
     def connection_lost(self, error):
         if self._connected:
             self._connected = False
+            if self._admitted_ip is not None:
+                self.guard.release(self._admitted_ip)
+                self._admitted_ip = None
             ip = peer_ip(self.session) if self.session else "-"
-            level = logging.DEBUG if _is_loopback(ip) else logging.INFO
-            log.log(level, kv("disconnect", sid=self.sid, ip=ip))
+            if not self._turned_away:  # a refused connection never logged a connect either
+                level = logging.DEBUG if _is_loopback(ip) else logging.INFO
+                log.log(level, kv("disconnect", sid=self.sid, ip=ip))
         super().connection_lost(error)
 
 
@@ -197,6 +261,8 @@ class Relay:
         self._worker: asyncio.Task | None = None
         self._activity: ActivityStore | None = None
         self._log_handler: ActivityLogHandler | None = None
+        self.connection_guard = ConnectionGuard()
+        self.authenticator: Authenticator | None = None
 
     @property
     def port(self) -> int:
@@ -236,13 +302,15 @@ class Relay:
         self.queue = MailQueue.open(s.queue_dir, s.queue_max_age_hours)
         self.handler = MicrosoftGraphHandler(s, self._graph, self.queue)
         load_middleware(s.middleware_dir, self.handler)
-        authenticator = Authenticator(s.auth_user, s.auth_pass)
+        authenticator = self.authenticator = Authenticator(s.auth_user, s.auth_pass)
+        guard = self.connection_guard
 
         def protocol():
             return RelaySMTP(
                 self.handler,
+                guard=guard,
                 hostname=banner_host,
-                ident="smtp-graph-relay",
+                ident="ESMTP",  # the greeting does not name the product
                 data_size_limit=s.max_message_size,
                 tls_context=tls_context,
                 require_starttls=False,

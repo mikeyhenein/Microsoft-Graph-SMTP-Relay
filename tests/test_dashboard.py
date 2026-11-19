@@ -1,9 +1,13 @@
 """The dashboard against a real relay and the fake Graph."""
 
+import asyncio
+import socket
+
 import aiohttp
 import pytest
 
 from conftest import exchange
+from version import __version__
 
 DASH_USER = "admin"
 DASH_PASS = "dashboard-password-for-tests"
@@ -54,8 +58,13 @@ async def test_wrong_password_then_lockout(dash_relay, browser):
     for _ in range(4):
         response = await sign_in(browser, dash_relay, password="wrong")
     assert response.headers["Location"] == "/login?error=locked"
-    response = await sign_in(browser, dash_relay)  # right password, but locked out now
+    response = await sign_in(browser, dash_relay, password="wrong")  # one checked attempt per 10 s...
+    response = await sign_in(browser, dash_relay)  # ...so the right password straight after is refused
     assert response.headers["Location"] == "/login?error=locked"
+    dash_relay.dashboard.lockout.slow = 0.2
+    await asyncio.sleep(0.3)
+    response = await sign_in(browser, dash_relay)  # and gets in on the next checked attempt
+    assert response.headers["Location"] == "/"
 
 
 async def test_sign_in_shows_activity_and_sign_out_ends_the_session(dash_relay, browser):
@@ -93,7 +102,6 @@ async def test_test_send_goes_through_the_relay(dash_relay, browser, fake_graph)
     sent = fake_graph.sent_mime()
     assert b"From: scanner@contoso.com" in sent and b"To: me@example.com" in sent
     assert b"X-Relay-Test: dashboard" in sent
-    from version import __version__
     assert f"Subject: smtp-graph-relay test message (v{__version__})".encode() in sent
     assert f"Relay version: {__version__}".encode() in sent and f"X-Relay-Version: {__version__}".encode() in sent
 
@@ -218,6 +226,53 @@ async def test_https_dashboard_marks_the_cookie_secure(settings, start_relay):
             assert response.headers["Location"] == "/"
             assert "Secure" in response.headers["Set-Cookie"]
             assert "Strict-Transport-Security" in response.headers
+
+
+async def test_less_to_fingerprint_before_sign_in(dash_relay, browser):
+    async with browser.get(f"{base(dash_relay)}/login") as response:
+        assert __version__ not in await response.text()
+        assert response.headers["Server"] == "relay"
+    for method, path in (("GET", "/nope"), ("PUT", "/api/summary")):
+        async with browser.request(method, f"{base(dash_relay)}{path}") as response:
+            assert response.status in (404, 405)
+            assert "default-src 'self'" in response.headers["Content-Security-Policy"]
+            assert response.headers["Server"] == "relay"
+    greeting = await asyncio.to_thread(lambda: socket.create_connection(("127.0.0.1", dash_relay.port), 5).recv(200))
+    assert b"relay" not in greeting.lower() and greeting.startswith(b"220 ")
+
+
+async def test_cross_site_posts_are_refused(dash_relay, browser):
+    for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Origin": "https://evil.example"}, {"Origin": "null"}):
+        async with browser.post(f"{base(dash_relay)}/login", data={"username": DASH_USER, "password": "wrong"},
+                                headers=headers, allow_redirects=False) as response:
+            assert response.status == 403
+    assert not dash_relay.dashboard.lockout.throttled("127.0.0.1")  # those never counted as failures
+    same = {"Sec-Fetch-Site": "same-origin", "Origin": base(dash_relay)}
+    async with browser.post(f"{base(dash_relay)}/login", data={"username": DASH_USER, "password": DASH_PASS},
+                            headers=same, allow_redirects=False) as response:
+        assert response.headers["Location"] == "/"
+
+
+async def test_test_send_is_rate_limited(dash_relay, browser, fake_graph):
+    await sign_in(browser, dash_relay)
+    replies = []
+    for i in range(6):
+        async with browser.post(f"{base(dash_relay)}/api/test-send",
+                                json={"from": "scanner@contoso.com", "to": f"me{i}@example.com"}) as response:
+            replies.append(await response.json())
+    assert [r["ok"] for r in replies] == [True] * 5 + [False]
+    assert replies[-1]["reply"] == "Too many test messages, wait a minute."
+    assert len(fake_graph.of("/sendMail")) == 5
+
+
+async def test_sign_out_ends_every_session(dash_relay, browser):
+    await sign_in(browser, dash_relay)
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as other:
+        await sign_in(other, dash_relay)
+        async with browser.post(f"{base(dash_relay)}/logout", allow_redirects=False):
+            pass
+        async with other.get(f"{base(dash_relay)}/api/summary") as response:
+            assert response.status == 401
 
 
 async def test_dashboard_is_off_without_credentials(relay):

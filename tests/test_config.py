@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from config import SMALL_MESSAGE_LIMIT, ConfigError, load_settings
@@ -68,6 +70,17 @@ def test_short_password_and_retired_setting_are_warnings():
     assert len(s.warnings) == 2
     assert any("16" in w for w in s.warnings)
     assert any("SAVE_TO_SENT" in w for w in s.warnings)
+
+
+def test_sample_passwords_are_refused():
+    """Red-team finding 6: the .env.sample placeholders are public, so they must never run."""
+    sample = (Path(__file__).resolve().parent.parent / ".env.sample").read_text()
+    smtp_pass = next(line.split("=", 1)[1] for line in sample.splitlines() if line.startswith("SMTP_AUTH_PASS="))
+    dash_pass = next(line.split("=", 1)[1] for line in sample.splitlines() if line.startswith("#DASHBOARD_PASS="))
+    assert any("SMTP_AUTH_PASS" in p and ".env.sample" in p for p in problems({**BASE, "SMTP_AUTH_PASS": smtp_pass}))
+    assert any("DASHBOARD_PASS" in p and ".env.sample" in p
+               for p in problems({**BASE, "DASHBOARD_USER": "admin", "DASHBOARD_PASS": dash_pass}))
+    assert "\nDASHBOARD_USER=" not in sample  # the dashboard ships switched off
 
 
 def test_dashboard_settings():
