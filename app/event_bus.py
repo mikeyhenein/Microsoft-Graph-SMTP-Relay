@@ -1,62 +1,65 @@
 import asyncio
+import inspect
 import logging
-from threading import Thread, RLock
+
+log = logging.getLogger("relay")
+
 
 class EventBus:
+    """
+    Named events middleware can subscribe to (see MIDDLEWARE.md).
+
+    Everything runs on the relay's single event loop. A handler that raises makes the
+    message fail with a temporary error (fail closed), so mail is never sent with a hook
+    silently skipped.
+    """
+
     def __init__(self):
-        self.__events = {}          # event_name -> [handlers]
-        self.__loop = None          # single long-lived loop
-        self.__thread = None        # single long-lived thread
-        self.__lock = RLock()
+        self.__events = {}  # event_name -> [handlers]
 
     def subscribe(self, event_name, handler):
-        with self.__lock:
-            self.__events.setdefault(event_name, []).append(handler)
+        self.__events.setdefault(event_name, []).append(handler)
 
     def unsubscribe(self, event_name, handler):
-        with self.__lock:
-            if event_name in self.__events and handler in self.__events[event_name]:
-                self.__events[event_name].remove(handler)
+        handlers = self.__events.get(event_name, [])
+        if handler in handlers:
+            handlers.remove(handler)
 
-    def __background_loop(self, loop):
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
+    def has_subscribers(self, *event_names) -> bool:
+        return any(self.__events.get(name) for name in event_names)
 
-    def __ensure_loop(self):
-        if self.__loop is None or self.__loop.is_closed():
-            loop = asyncio.new_event_loop()
-            t = Thread(target=self.__background_loop, args=(loop,), daemon=True)
-            t.start()
-            self.__loop = loop
-            self.__thread = t
+    def clear(self):
+        self.__events.clear()
 
-    def publishSync(self, event_name, *args) -> bool:
-        # Reuse the single loop/thread; do NOT create a new one per call.
-        self.__ensure_loop()
-        fut = asyncio.run_coroutine_threadsafe(
-            self.publish(event_name, *args),   # <-- expand args correctly
-            self.__loop
-        )
-        return fut.result()
-
-    async def publish(self, event_name, *args) -> bool:
+    async def publish(self, event_name, *args):
+        """Run every handler in order; returns the last handler's result (False if none)."""
         result = False
         # snapshot handlers to avoid mutation during iteration
-        handlers = list(self.__events.get(event_name, []))
-        if handlers:
-            logging.debug(f"Publishing event: {event_name}")
-            for handler in handlers:
-                if asyncio.iscoroutinefunction(handler):
-                    result = await handler(*args)
-                else:
-                    result = handler(*args)
+        for handler in list(self.__events.get(event_name, [])):
+            log.debug(f"Publishing event: {event_name}")
+            result = handler(*args)
+            if inspect.isawaitable(result):
+                result = await result
         return result
 
-    # (optional) call this on clean shutdown if you wire signals
-    def shutdown(self, timeout=1.0):
-        if self.__loop and self.__loop.is_running():
-            self.__loop.call_soon_threadsafe(self.__loop.stop)
-            if self.__thread:
-                self.__thread.join(timeout=timeout)
+    def publishSync(self, event_name, *args):
+        """
+        For callers that cannot await (the SMTP authenticator). Plain handlers run inline;
+        coroutine handlers are scheduled on the running loop and their result is not waited for.
+        """
+        result = False
+        for handler in list(self.__events.get(event_name, [])):
+            if inspect.iscoroutinefunction(handler):
+                task = asyncio.get_running_loop().create_task(handler(*args))
+                task.add_done_callback(_log_task_failure)
+            else:
+                result = handler(*args)
+        return result
+
+
+def _log_task_failure(task: asyncio.Task):
+    if not task.cancelled() and task.exception() is not None:
+        log.error("Async auth middleware failed", exc_info=task.exception())
+
 
 event_bus_instance = EventBus()

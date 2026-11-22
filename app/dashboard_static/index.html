@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Relay dashboard</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body class="loading">
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 7l9 6l9 -6"></path></svg>
+      </span>
+      <span class="brand-name">SMTP Graph Relay</span>
+    </div>
+    <div id="status-pills" class="pills" aria-live="polite">
+      <span class="pill muted-pill"><span class="dot"></span>Connecting</span>
+    </div>
+    <div class="topbar-right">
+      <span id="who" class="muted small"></span>
+      <form method="post" action="/logout">
+        <button type="submit" class="link-btn">Sign out</button>
+      </form>
+    </div>
+  </div>
+</header>
+
+<main class="page">
+  <section class="card summary" aria-label="Last 24 hours">
+    <span class="eyebrow">Last 24 hours</span>
+    <div id="metrics" class="metrics"></div>
+    <span id="updated" class="faint small push-right">Loading…</span>
+  </section>
+
+  <section id="attention" class="card attention" aria-label="Needs attention" hidden>
+    <div class="attention-head">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4"></path><path d="M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0z"></path><path d="M12 16h.01"></path></svg>
+      <h2 class="h2">Needs attention</h2>
+      <span id="attention-count" class="pill bad"></span>
+    </div>
+    <div id="attention-list"></div>
+  </section>
+
+  <section class="card" aria-label="Devices">
+    <div class="card-head">
+      <h2 class="h2">Devices</h2>
+      <span class="faint small">Name from the device and DNS · the IP may be a Docker address</span>
+    </div>
+    <div id="device-list"></div>
+  </section>
+
+  <section class="card" aria-label="Activity">
+    <div class="card-head">
+      <h2 class="h2">Activity</h2>
+      <div class="head-actions">
+        <button id="cancel-all" type="button" class="ghost danger" hidden>Cancel all retries</button>
+        <span class="faint small">Messages and retries, newest first</span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Device</th><th>From → To</th><th>Result</th><th class="num">Tries</th></tr></thead>
+        <tbody id="activity-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card test" aria-label="Send a test">
+    <div class="card-head flat">
+      <h2 class="h2">Send a test</h2>
+      <span class="faint small">For when something looks wrong. It goes through the relay exactly like a device.</span>
+    </div>
+    <form id="test-form" class="test-form">
+      <div class="field grow">
+        <label for="test-from">From</label>
+        <input id="test-from" name="from" type="email" list="sender-list" autocomplete="off" required>
+        <datalist id="sender-list"></datalist>
+      </div>
+      <div class="field grow">
+        <label for="test-to">To</label>
+        <input id="test-to" name="to" type="email" required>
+      </div>
+      <button id="test-button" class="btn btn-primary" type="submit">Send test</button>
+    </form>
+    <div id="sender-chips" class="chips" aria-label="Suggested From addresses"></div>
+    <div id="test-result" class="test-result" role="status" aria-live="polite" hidden></div>
+  </section>
+
+  <section class="card" aria-label="Raw log">
+    <div class="card-head flat">
+      <button id="log-toggle" type="button" class="ghost" aria-expanded="false" aria-controls="log-body">
+        <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6l-6 6"></path></svg>
+        <span id="log-toggle-label">Show raw log (last 300 lines)</span>
+      </button>
+      <span class="faint small">For deeper debugging; everything above comes from these lines</span>
+    </div>
+    <div id="log-body" hidden>
+      <div class="toolbar">
+        <button type="button" class="chip chip-on" data-level="all">All</button>
+        <button type="button" class="chip" data-level="warn">Warnings</button>
+        <button type="button" class="chip" data-level="error">Errors</button>
+        <label for="log-search" class="visually-hidden">Filter by IP or text</label>
+        <input id="log-search" type="search" placeholder="Filter by IP or text">
+      </div>
+      <div id="log-lines" class="log"></div>
+    </div>
+  </section>
+
+  <p id="footer" class="faint small center">smtp-graph-relay</p>
+</main>
+</body>
+</html>
